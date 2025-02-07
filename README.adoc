@@ -1,3 +1,31 @@
+= Deploying the Configuration File to the iOS App
+
+= Initial Setup (First-Time Only)
+Run the following commands to build and start the Aware Micro server:
+```
+cd aware-micro
+./gradlew clean build run
+```
+
+This will generate an aware-config.json file in the current directory.
+Edit this file to include the required parameters for your study.
+
+= Running the Server
+After updating the configuration file, start the server with:
+And then run 
+```
+./gradlew run
+```
+= Configuring the iOS App
+1. Open Aware V2 on your iPhone.
+2. Tap Study URL and enter the server's IP address.
+   The IP address should match the machine running the Aware Micro server.
+   The port number should match the value set in the "server_port" field of aware-config.json.
+3. Tap Select to apply the configuration.
+
+Your iOS app will now be configured with the same settings as your Aware Micro server.
+
+
 = AWARE Micro
 
 This is the new AWARE server for conducting studies using AWARE. It is a reactive, non-blocking server able to handle thousands of requests per second on a single machine.
