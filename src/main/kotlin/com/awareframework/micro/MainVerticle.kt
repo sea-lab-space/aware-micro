@@ -27,7 +27,15 @@ import io.vertx.ext.web.templ.pebble.PebbleTemplateEngine
 import java.net.URL
 import javax.xml.parsers.DocumentBuilderFactory
 
+import io.vertx.mysqlclient.MySQLConnectOptions
+import io.vertx.mysqlclient.MySQLPool
+import io.vertx.sqlclient.PoolOptions
+import io.vertx.sqlclient.Tuple
+import io.vertx.core.CompositeFuture
+
+
 class MainVerticle : AbstractVerticle() {
+  private lateinit var mySQLClient: MySQLPool
 
   private val logger = KotlinLogging.logger {}
 
@@ -38,43 +46,70 @@ class MainVerticle : AbstractVerticle() {
 
     logger.info { "AWARE Micro initializing..." }
 
-    val serverOptions = HttpServerOptions().setMaxWebSocketMessageSize(1024 * 1024 * 20).setMaxChunkSize(1024 * 1024 * 50).setMaxInitialLineLength(1024 * 1024 * 50).setMaxHeaderSize(1024 * 1024 * 50); 
+    val serverOptions = HttpServerOptions()
+        .setMaxWebSocketMessageSize(1024 * 1024 * 20)
+    logger.info { "Server options initialized with increased limits" }
+
     val pebbleEngine = PebbleTemplateEngine.create(vertx, PebbleEngine.Builder().cacheActive(false).build())
+    logger.info { "Pebble engine created" }
+
     val eventBus = vertx.eventBus()
+    logger.info { "EventBus initialized" }
 
     val router = Router.router(vertx)
-    router.route().handler(BodyHandler.create().setBodyLimit(1024 * 1024 * 50));
+    router.route().handler(BodyHandler.create().setBodyLimit(1024 * 1024 * 50))
+    logger.info { "BodyHandler and router set up" }
+
     router.route("/cache/*").handler(StaticHandler.create("cache"))
+    logger.info { "StaticHandler set up for /cache/*" }
+
     router.route().handler {
       logger.info { "Processing ${it.request().scheme()} ${it.request().method()} : ${it.request().path()} with the following data ${it.request().params().toList()}" }
       it.next()
     }
 
+    router.route().failureHandler { context ->
+      val failure = context.failure()
+      logger.error(failure) { "Unhandled exception occurred" }
+      context.response().setStatusCode(500).end("Internal Server Error")
+    }
+  
+
     val configJsonFile = ConfigStoreOptions()
       .setType("file")
       .setFormat("json")
       .setConfig(JsonObject().put("path", "./aware-config.json"))
+    logger.info { "Config store options initialized" }
 
     val configRetrieverOptions = ConfigRetrieverOptions()
       .setScanPeriod(5000)
       .addStore(configJsonFile)
+    logger.info { "Config retriever options initialized" }
 
     val configReader = ConfigRetriever.create(vertx, configRetrieverOptions)
+    logger.info { "Config retriever created" }
     configReader.getConfig { config ->
 
       if (config.succeeded() && config.result().containsKey("server")) {
+        logger.info { "Configuration successfully retrieved" }
         parameters = config.result()
         val serverConfig = parameters.getJsonObject("server")
         val study = parameters.getJsonObject("study")
+        logger.info { "Server and study configuration loaded" }
+
+        initDatabase()
 
         // HttpServerOptions.host is the host to listen on. So using |server_host|, not |external_server_host| here.
         // See also: https://vertx.io/docs/4.3.3/apidocs/io/vertx/core/net/NetServerOptions.html#DEFAULT_HOST
         serverOptions.host = serverConfig.getString("server_host")
+        logger.info { "Server host set to ${serverConfig.getString("server_host")}" }
+
 
         /**
          * Generate QRCode to join the study using Google's Chart API
          */
         router.route(HttpMethod.GET, "/:studyNumber/:studyKey").handler { route ->
+        logger.info {"GET received /:studyNumber/:studyKey"}
           if (validRoute(
               study,
               route.request().getParam("studyNumber").toInt(),
@@ -133,6 +168,9 @@ class MainVerticle : AbstractVerticle() {
          * - when checking study status with the study_check=1.
          */
         router.route(HttpMethod.POST, "/index.php/:studyNumber/:studyKey").handler { route ->
+        logger.info {
+            "/index.php/:studyNumber/:studyKey POST"
+          }
           if (validRoute(
               study,
               route.request().getParam("studyNumber").toInt(),
@@ -180,84 +218,258 @@ class MainVerticle : AbstractVerticle() {
         }
 
         router.route(HttpMethod.POST, "/index.php/:studyNumber/:studyKey/:table/:operation").handler { route ->
+          // Log the incoming request
+          logger.info { "Incoming POST request: studyNumber=${route.request().getParam("studyNumber")}, studyKey=${route.request().getParam("studyKey")}, table=${route.request().getParam("table")}, operation=${route.request().getParam("operation")}" }
+
+          // Validate the route
           if (validRoute(
               study,
               route.request().getParam("studyNumber").toInt(),
               route.request().getParam("studyKey")
             )
           ) {
+            logger.info { "Route validation successful for studyNumber=${route.request().getParam("studyNumber")} and studyKey=${route.request().getParam("studyKey")}" }
+
             when (route.request().getParam("operation")) {
               "create_table" -> {
-                //Commented the following line as we merged with insert. Only here so that legacy client thinks all is ok
-                //eventBus.publish("createTable", route.request().getParam("table"))
+                logger.info { "Operation: create_table for table=${route.request().getParam("table")}" }
+                // Commented the following line as we merged with insert. Only here so that legacy client thinks all is ok
+                // eventBus.publish("createTable", route.request().getParam("table"))
                 route.response().statusCode = 200
                 route.response().end()
               }
               "insert" -> {
+                val table = route.request().getParam("table")
+                val deviceId = route.request().getFormAttribute("device_id")
+                val data = route.request().getFormAttribute("data")
+
+                logger.info { "Operation: insert. Table=$table, DeviceId=$deviceId, Data=$data" }
+
                 eventBus.publish(
                   "insertData",
                   JsonObject()
-                    .put("table", route.request().getParam("table"))
-                    .put("device_id", route.request().getFormAttribute("device_id"))
-                    .put("data", route.request().getFormAttribute("data"))
+                    .put("table", table)
+                    .put("device_id", deviceId)
+                    .put("data", data)
                 )
                 route.response().statusCode = 200
                 route.response().end()
+                logger.info { "Insert operation published to EventBus for table=$table, deviceId=$deviceId" }
               }
               "update" -> {
+                val table = route.request().getParam("table")
+                val deviceId = route.request().getFormAttribute("device_id")
+                val data = route.request().getFormAttribute("data")
+
+                logger.info { "Operation: update. Table=$table, DeviceId=$deviceId, Data=$data" }
+
                 eventBus.publish(
                   "updateData",
                   JsonObject()
-                    .put("table", route.request().getParam("table"))
-                    .put("device_id", route.request().getFormAttribute("device_id"))
-                    .put("data", route.request().getFormAttribute("data"))
+                    .put("table", table)
+                    .put("device_id", deviceId)
+                    .put("data", data)
                 )
                 route.response().statusCode = 200
                 route.response().end()
+                logger.info { "Update operation published to EventBus for table=$table, deviceId=$deviceId" }
               }
               "delete" -> {
+                val table = route.request().getParam("table")
+                val deviceId = route.request().getFormAttribute("device_id")
+                val data = route.request().getFormAttribute("data")
+
+                logger.info { "Operation: delete. Table=$table, DeviceId=$deviceId, Data=$data" }
+
                 eventBus.publish(
                   "deleteData",
                   JsonObject()
-                    .put("table", route.request().getParam("table"))
-                    .put("device_id", route.request().getFormAttribute("device_id"))
-                    .put("data", route.request().getFormAttribute("data"))
+                    .put("table", table)
+                    .put("device_id", deviceId)
+                    .put("data", data)
                 )
                 route.response().statusCode = 200
                 route.response().end()
+                logger.info { "Delete operation published to EventBus for table=$table, deviceId=$deviceId" }
               }
               "query" -> {
+                val table = route.request().getParam("table")
+                val deviceId = route.request().getFormAttribute("device_id")
+                val start = route.request().getFormAttribute("start").toDouble()
+                val end = route.request().getFormAttribute("end").toDouble()
+
+                logger.info { "Operation: query. Table=$table, DeviceId=$deviceId, Start=$start, End=$end" }
+
                 val requestData = JsonObject()
-                  .put("table", route.request().getParam("table"))
-                  .put("device_id", route.request().getFormAttribute("device_id"))
-                  .put("start", route.request().getFormAttribute("start").toDouble())
-                  .put("end", route.request().getFormAttribute("end").toDouble())
+                  .put("table", table)
+                  .put("device_id", deviceId)
+                  .put("start", start)
+                  .put("end", end)
 
                 eventBus.request<JsonArray>("getData", requestData) { response ->
                   if (response.succeeded()) {
+                    logger.info { "Query successful for table=$table, deviceId=$deviceId. Result=${response.result().body()}" }
                     route.response().statusCode = 200
                     route.response().end(response.result().body().encode())
                   } else {
+                    logger.error(response.cause()) { "Query failed for table=$table, deviceId=$deviceId" }
                     route.response().statusCode = 401
                     route.response().end()
                   }
                 }
               }
               else -> {
+                logger.warn { "Unsupported operation: ${route.request().getParam("operation")}" }
                 route.response().statusCode = 401
                 route.response().end()
               }
             }
           } else {
+            logger.warn { "Route validation failed for studyNumber=${route.request().getParam("studyNumber")} and studyKey=${route.request().getParam("studyKey")}" }
             route.response().statusCode = 401
             route.response().end()
           }
         }
 
+
+
+router.route().last().handler { ctx ->
+    logger.warn { "Unhandled request: ${ctx.request().method()} ${ctx.request().path()} with data ${ctx.request().params().toList()}" }
+    ctx.response().setStatusCode(404).end("Not Found")
+}
+
+router.route(HttpMethod.POST, "/").handler { ctx ->
+    val body = ctx.bodyAsString
+    val params = ctx.request().params()
+    val deviceId = params.get("device_id")
+
+    // 日志记录
+    logger.info { "Processing POST / request with device_id: $deviceId" }
+
+    if (deviceId != null) {
+        // 返回 study 配置
+        val config = getStudyConfig()
+        logger.info { "Returning study configuration for device_id: $deviceId - ${config.encodePrettily()}" }
+
+        ctx.response()
+            .putHeader(HttpHeaders.CONTENT_TYPE, "application/json")
+            .setStatusCode(200)
+            .end(config.encode())
+    } else {
+        // 没提供 device_id 的error out
+        logger.warn { "POST / request missing device_id parameter" }
+        ctx.response()
+            .setStatusCode(400)
+            .end("Missing required parameter: device_id")
+    }
+}
+
+router.route(HttpMethod.POST, "/:table/:operation").handler { route ->
+    val table = route.request().getParam("table")
+    val operation = route.request().getParam("operation")
+
+    logger.info { "Matched POST request!: table=$table, operation=$operation" }
+    logger.info { "Operation extracted from request: $operation" }
+
+
+
+
+
+    when (operation) {
+        "insert" -> {
+          logger.info { "Received INSERT operation" }
+    val table = route.request().getParam("table")
+    val dataJson = route.request().getFormAttribute("data")
+    logger.info { "Received insert request: table=$table, dataJson=$dataJson" }
+
+    if (dataJson != null) {
+        logger.info { "Raw data received for table `$table`: $dataJson" }
+
+        try {
+            val records = JsonArray(dataJson)
+            logger.info { "Parsed data for table `$table`: ${records.encodePrettily()}" }
+            val insertFutures = records.map { record ->
+                val recordJson = record as JsonObject
+                val columns = recordJson.fieldNames().joinToString(", ") { "`$it`" }
+                val placeholders = recordJson.fieldNames().joinToString(", ") { "?" }
+                val values = recordJson.fieldNames().map { recordJson.getValue(it) }
+
+                val insertQuery = "INSERT INTO `$table` ($columns) VALUES ($placeholders)"
+
+                logger.info { "Generated SQL for table `$table`: $insertQuery with values: $values" }
+
+                mySQLClient.preparedQuery(insertQuery)
+                    .execute(Tuple.wrap(values))
+            }
+
+            // 等待所有插入完成
+            CompositeFuture.all(insertFutures)
+                .onSuccess {
+                    logger.info { "Successfully inserted data into table `$table`" }
+                    route.response().setStatusCode(200).end("Insert successful")
+                }
+                .onFailure { error ->
+                    logger.error(error) { "Insert operation failed for table=$table" }
+                    route.response().setStatusCode(500).end("Insert failed")
+                }
+        } catch (e: Exception) {
+            logger.error(e) { "Failed to parse `data` for insert operation in table `$table`" }
+            route.response().setStatusCode(400).end("Invalid data format")
+        }
+    } else {
+        logger.warn { "No data provided for insert operation in table `$table`" }
+        route.response().setStatusCode(400).end("No data provided")
+    }
+}
+
+
+
+        "create_table" -> {
+            val fields = route.request().getFormAttribute("fields") ?: ""
+            logger.info { "Create table operation: Table=$table, Fields=$fields" }
+
+            if (fields.isNotEmpty()) {
+                val fixedFields = fields
+                    .replace("autoincrement", "AUTO_INCREMENT")
+                    .replace("real", "DOUBLE")
+                    .replace("text default ''", "TEXT")
+                    .replace("trigger", "`trigger`")
+
+                val createTableQuery = "CREATE TABLE IF NOT EXISTS `$table` ($fixedFields)"
+                mySQLClient.query(createTableQuery)
+                    .execute()
+                    .onSuccess {
+                        logger.info { "Table `$table` created successfully" }
+                        route.response().setStatusCode(200).end("Table created successfully")
+                    }
+                    .onFailure { error ->
+                        logger.error(error) { "Failed to create table `$table`" }
+                        route.response().setStatusCode(500).end("Failed to create table")
+                    }
+            } else {
+                logger.warn { "No fields provided for creating table `$table`" }
+                route.response().setStatusCode(400).end("No fields provided")
+            }
+        }
+
+
+
+        else -> {
+            logger.warn { "Unsupported operation: $operation for table=$table" }
+            route.response().setStatusCode(400).end("Unsupported operation")
+        }
+    }
+
+}
+
+
         /**
          * Default route, landing page of the server
          */
         router.route(HttpMethod.GET, "/").handler { route ->
+        logger.info {
+            "/ GET"
+          }
           route.response().putHeader("content-type", "text/html").end(
             "Hello from AWARE Micro!<br/>Join study: <a href=\"${getExternalServerHost(serverConfig)}:${getExternalServerPort(serverConfig)}/${study.getInteger(
               "study_number"
@@ -424,13 +636,36 @@ class MainVerticle : AbstractVerticle() {
       }
     }
   }
+  private fun initDatabase() {
+    val dbConfig = parameters.getJsonObject("server")
+    val connectOptions = MySQLConnectOptions()
+        .setPort(dbConfig.getInteger("database_port"))
+        .setHost(dbConfig.getString("database_host"))
+        .setDatabase(dbConfig.getString("database_name"))
+        .setUser(dbConfig.getString("database_user"))
+        .setPassword(dbConfig.getString("database_pwd"))
+
+    val poolOptions = PoolOptions().setMaxSize(5)
+
+    mySQLClient = MySQLPool.pool(vertx, connectOptions, poolOptions)
+    logger.info { "MySQL client initialized" }
+}
+
+
+
 
   /**
    * Check valid study key and number
    */
   fun validRoute(studyInfo: JsonObject, studyNumber: Int, studyKey: String): Boolean {
+    logger.info {
+            "CHECKING valid route"
+          }
+    logger.info {studyNumber == studyInfo.getInteger("study_number") && studyKey == studyInfo.getString("study_key")}
     return studyNumber == studyInfo.getInteger("study_number") && studyKey == studyInfo.getString("study_key")
   }
+
+  
 
   fun getStudyConfig(): JsonArray {
     val serverConfig = parameters.getJsonObject("server")
