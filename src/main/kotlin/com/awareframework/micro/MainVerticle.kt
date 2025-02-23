@@ -27,6 +27,10 @@ import io.vertx.ext.web.templ.pebble.PebbleTemplateEngine
 import java.net.URL
 import javax.xml.parsers.DocumentBuilderFactory
 
+
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
+
 class MainVerticle : AbstractVerticle() {
 
   private val logger = KotlinLogging.logger {}
@@ -38,7 +42,7 @@ class MainVerticle : AbstractVerticle() {
 
     logger.info { "AWARE Micro initializing..." }
 
-    val serverOptions = HttpServerOptions().setMaxWebSocketMessageSize(1024 * 1024 * 20).setMaxChunkSize(1024 * 1024 * 50).setMaxInitialLineLength(1024 * 1024 * 50).setMaxHeaderSize(1024 * 1024 * 50); 
+    val serverOptions = HttpServerOptions().setMaxWebSocketMessageSize(1024 * 1024 * 20).setMaxChunkSize(1024 * 1024 * 50).setMaxInitialLineLength(1024 * 1024 * 50).setMaxHeaderSize(1024 * 1024 * 50).setMaxFormAttributeSize(-1); 
     val pebbleEngine = PebbleTemplateEngine.create(vertx, PebbleEngine.Builder().cacheActive(false).build())
     val eventBus = vertx.eventBus()
 
@@ -70,6 +74,117 @@ class MainVerticle : AbstractVerticle() {
         // HttpServerOptions.host is the host to listen on. So using |server_host|, not |external_server_host| here.
         // See also: https://vertx.io/docs/4.3.3/apidocs/io/vertx/core/net/NetServerOptions.html#DEFAULT_HOST
         serverOptions.host = serverConfig.getString("server_host")
+
+
+        /**
+         * Uncomment this route for debug sake
+         * Handles incoming HTTP requests, extracts and processes form-encoded data, 
+         * and logs key request details before passing it to the next handler.
+         * 
+         * - Parses `application/x-www-form-urlencoded` data manually.
+         * - Extracts the "data" field without URL-decoding JSON values.
+         * - Parses JSON data if present and logs timestamps from the first and last records.
+         * - Logs request method, headers, and parsed content.
+         * - Calls `routingContext.next()` to continue request processing.
+         */
+      //   router.route().handler { routingContext ->
+      //     val request = routingContext.request()
+      //     val body = routingContext.body().asString() ?: "No Body"
+      
+      //     // Log the raw body to ensure it is received correctly
+      //     logger.warn { "Raw Body Received: $body" }
+      
+      //     var dataString: String? = null
+      
+      //     // Manually parse x-www-form-urlencoded data
+      //     val params = body.split("&")
+      //     val paramMap = mutableMapOf<String, String>()
+      
+      //     for (param in params) {
+      //         val parts = param.split("=")
+      //         if (parts.size == 2) {
+      //             val key = parts[0]
+      //             val rawValue = parts[1]
+      
+      //             // Decode only if the key is not "data" (JSON should not be URL-decoded)
+      //             val value = if (key == "data") rawValue else URLDecoder.decode(rawValue, StandardCharsets.UTF_8.name())
+      
+      //             paramMap[key] = value
+      //         }
+      //     }
+      
+      //     // Extract the "data" field
+      //     dataString = paramMap["data"]
+      //     logger.warn { "Extracted 'data' field: ${dataString ?: "N/A"}" }
+      
+      //     var dataLength = 0
+      //     var firstTimestamp: Long? = null
+      //     var lastTimestamp: Long? = null
+      //     var firstRecord: JsonObject? = null
+      //     var lastRecord: JsonObject? = null
+      
+      //     if (!dataString.isNullOrBlank()) {
+      //         try {
+      //             // Parse the "data" field as a JSON array
+      //             val dataArray = JsonArray(dataString)
+      //             dataLength = dataArray.size()
+      
+      //             if (dataLength > 0) {
+      //                 firstRecord = dataArray.getJsonObject(0)
+      //                 lastRecord = dataArray.getJsonObject(dataLength - 1)
+      
+      //                 firstTimestamp = firstRecord.getLong("timestamp")
+      //                 lastTimestamp = lastRecord.getLong("timestamp")
+      //             }
+      //         } catch (e: Exception) {
+      //             logger.warn(e) { "Failed to parse data JSON" }
+      //         }
+      //     }
+      
+      //     // Log request details
+      //     logger.warn { 
+      //         """
+      //         HTTP Request Received
+      //         Method: ${request.method()}
+      //         Path: ${request.path()}
+      //         Headers: ${request.headers().entries()}
+      //         Content-Length (Header): ${request.getHeader("Content-Length") ?: "N/A"}
+      //         Body Length (bytes): ${body.length}
+      //         Data List Length: $dataLength
+      //         First Timestamp: ${firstTimestamp ?: "N/A"}
+      //         Last Timestamp: ${lastTimestamp ?: "N/A"}
+      //         First Record: ${firstRecord?.encodePrettily() ?: "N/A"}
+      //         Last Record: ${lastRecord?.encodePrettily() ?: "N/A"}
+      //         ===========================
+      //         """.trimIndent()
+      //     }
+      
+      //     routingContext.next()
+      // }
+      
+           
+      fun parseFormEncodedBody(body: String): Map<String, String> {
+        val paramMap = mutableMapOf<String, String>()
+    
+        // Split the body by '&' to get key-value pairs
+        val params = body.split("&")
+        
+        for (param in params) {
+            val parts = param.split("=")
+            if (parts.size == 2) {
+                val key = parts[0]
+                val rawValue = parts[1]
+    
+                // Decode only if the key is not "data" (JSON should not be URL-decoded)
+                val value = if (key == "data") rawValue else URLDecoder.decode(rawValue, StandardCharsets.UTF_8.name())
+    
+                paramMap[key] = value
+            }
+        }
+    
+        return paramMap
+    }
+
 
         /**
          * Generate QRCode to join the study using Google's Chart API
@@ -180,6 +295,10 @@ class MainVerticle : AbstractVerticle() {
         }
 
         router.route(HttpMethod.POST, "/index.php/:studyNumber/:studyKey/:table/:operation").handler { route ->
+
+        val body = route.body().asString() ?: ""
+        val parsedParams = parseFormEncodedBody(body) // Parse the form data into a map
+          
           if (validRoute(
               study,
               route.request().getParam("studyNumber").toInt(),
@@ -198,8 +317,8 @@ class MainVerticle : AbstractVerticle() {
                   "insertData",
                   JsonObject()
                     .put("table", route.request().getParam("table"))
-                    .put("device_id", route.request().getFormAttribute("device_id"))
-                    .put("data", route.request().getFormAttribute("data"))
+                    .put("device_id", parsedParams["device_id"]) // Extracted from the parsed body
+                    .put("data", parsedParams["data"]) // Extracted from the parsed body
                 )
                 route.response().statusCode = 200
                 route.response().end()
@@ -209,8 +328,8 @@ class MainVerticle : AbstractVerticle() {
                   "updateData",
                   JsonObject()
                     .put("table", route.request().getParam("table"))
-                    .put("device_id", route.request().getFormAttribute("device_id"))
-                    .put("data", route.request().getFormAttribute("data"))
+                    .put("device_id", parsedParams["device_id"]) // Extracted from the parsed body
+                    .put("data", parsedParams["data"]) // Extracted from the parsed body
                 )
                 route.response().statusCode = 200
                 route.response().end()
@@ -220,8 +339,8 @@ class MainVerticle : AbstractVerticle() {
                   "deleteData",
                   JsonObject()
                     .put("table", route.request().getParam("table"))
-                    .put("device_id", route.request().getFormAttribute("device_id"))
-                    .put("data", route.request().getFormAttribute("data"))
+                    .put("device_id", parsedParams["device_id"]) // Extracted from the parsed body
+                    .put("data", parsedParams["data"]) // Extracted from the parsed body
                 )
                 route.response().statusCode = 200
                 route.response().end()
@@ -229,7 +348,7 @@ class MainVerticle : AbstractVerticle() {
               "query" -> {
                 val requestData = JsonObject()
                   .put("table", route.request().getParam("table"))
-                  .put("device_id", route.request().getFormAttribute("device_id"))
+                  .put("device_id", parsedParams["device_id"]) 
                   .put("start", route.request().getFormAttribute("start").toDouble())
                   .put("end", route.request().getFormAttribute("end").toDouble())
 
