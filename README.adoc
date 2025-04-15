@@ -52,7 +52,7 @@ sudo dnf install git
 
 Check out the latest source code of the server
 ```
-git clone https://github.com/denzilferreira/aware-micro.git
+git clone https://github.com/sea-lab-space/aware-micro.git
 ```
 
 == Running the server with support for runtime study configuration changes
